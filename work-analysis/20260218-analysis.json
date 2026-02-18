@@ -1,0 +1,244 @@
+{
+  "task": {
+    "title": "거래량 이동평균선을 1분봉에서 30분봉(df_nm) 기반 SMA(100)으로 변경",
+    "description": "현재 1분봉(df_1m) 기반으로 계산되는 거래량 이동평균선(VOL_MA_WINDOW_MINUTE)을 30분봉(df_nm) 기반 SMA(100)으로 변경한다. 환경변수명을 VOL_MA_WINDOW_NM으로 변경하고, indicator_calculator.py에 NaN 가드를 추가하며, _max_candles를 150으로 증가시켜 SMA(100) 계산에 충분한 데이터를 확보한다. PERIOD_VOLUME_MINUTES 기반 1분봉 거래량 합산 로직은 그대로 유지한다.",
+    "priority": "medium"
+  },
+  "affected_components": [
+    {
+      "name": "config.py (Setting)",
+      "file": "/Users/minseop/proj/auto-trading/src/utils/config.py:43",
+      "reason": "환경변수명 VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM 변경, description 업데이트"
+    },
+    {
+      "name": ".env",
+      "file": "/Users/minseop/proj/auto-trading/.env:29",
+      "reason": "환경변수 키명 VOL_MA_WINDOW_MINUTE=100 -> VOL_MA_WINDOW_NM=100 변경"
+    },
+    {
+      "name": "IndicatorCalculator",
+      "file": "/Users/minseop/proj/auto-trading/src/indicator_calculator.py:74",
+      "reason": "get_latest_volume_ma()에서 NaN 반환 시 None으로 변환하는 가드 추가"
+    },
+    {
+      "name": "StrategyManager.check_enter_signal",
+      "file": "/Users/minseop/proj/auto-trading/src/strategy_manager.py:25",
+      "reason": "vol_ma 파라미터 타입을 float -> Optional[float]로 변경"
+    },
+    {
+      "name": "StrategyManager.is_period_volume_above_minimum",
+      "file": "/Users/minseop/proj/auto-trading/src/strategy_manager.py:228",
+      "reason": "vol_ma 파라미터 타입을 float -> Optional[float]로 변경, None 가드 추가"
+    },
+    {
+      "name": "DataManager",
+      "file": "/Users/minseop/proj/auto-trading/src/data_manager.py:42",
+      "reason": "_max_candles 100->150, vol_ma 계산을 df_1m->df_nm으로 변경, 변수명 vol_ma_1m->vol_ma_nm"
+    },
+    {
+      "name": "Trader",
+      "file": "/Users/minseop/proj/auto-trading/src/trader.py:30",
+      "reason": "30분봉 초기 로딩 limit 100->150으로 증가"
+    },
+    {
+      "name": "STRATEGY.md",
+      "file": "/Users/minseop/proj/auto-trading/docs/STRATEGY.md",
+      "reason": "VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM, 1분봉 -> 30분봉 설명 변경 (3곳)"
+    },
+    {
+      "name": "COMPONENTS.md",
+      "file": "/Users/minseop/proj/auto-trading/docs/COMPONENTS.md",
+      "reason": "vol_ma_1m -> vol_ma_nm, df_1m -> df_nm, VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM (3곳)"
+    },
+    {
+      "name": "CONFIGURATION.md",
+      "file": "/Users/minseop/proj/auto-trading/docs/CONFIGURATION.md",
+      "reason": "VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM, description 변경 (3곳)"
+    }
+  ],
+  "architecture_patterns": {
+    "primary": "Queue-based Async Processing",
+    "secondary": [
+      "Thread-Safe Singleton (PositionState)",
+      "Strategy Pattern (StrategyManager)",
+      "Manager Pattern (DataManager)"
+    ],
+    "justification": "기존 아키텍처를 유지하면서 DataManager의 vol_ma 계산 데이터 소스만 df_1m에서 df_nm으로 변경. 전략 로직 구조는 그대로 보존."
+  },
+  "implementation_guide": {
+    "steps": [
+      {
+        "step_number": 1,
+        "title": "config.py: 환경변수명 변경",
+        "description": "VOL_MA_WINDOW_MINUTE를 VOL_MA_WINDOW_NM으로 변경하고 description을 30분봉 기반으로 업데이트한다.",
+        "code_example": "# Before (line 43):\nVOL_MA_WINDOW_MINUTE: int = Field(100, ge=1, description=\"1분 이동평균선 길이\")\n\n# After:\nVOL_MA_WINDOW_NM: int = Field(100, ge=1, description=\"30분봉 거래량 이동평균선 길이\")",
+        "file_location": "/Users/minseop/proj/auto-trading/src/utils/config.py:43"
+      },
+      {
+        "step_number": 2,
+        "title": ".env: 환경변수 키 변경",
+        "description": "VOL_MA_WINDOW_MINUTE=100을 VOL_MA_WINDOW_NM=100으로 변경한다.",
+        "code_example": "# Before (line 29):\nVOL_MA_WINDOW_MINUTE=100\n\n# After:\nVOL_MA_WINDOW_NM=100",
+        "file_location": "/Users/minseop/proj/auto-trading/.env:29"
+      },
+      {
+        "step_number": 3,
+        "title": "indicator_calculator.py: NaN 가드 추가",
+        "description": "get_latest_volume_ma()에서 ta.sma() 결과의 마지막 값이 NaN일 경우 None을 반환하도록 한다.",
+        "code_example": "# Before (lines 72-76):\nif volume_ma is not None and not volume_ma.empty:\n    last_value = volume_ma.iloc[-1]\n    return last_value\n\n# After:\nif volume_ma is not None and not volume_ma.empty:\n    last_value = volume_ma.iloc[-1]\n    if pd.isna(last_value):\n        logger.warning(\"거래량 이동평균 값이 NaN (데이터 부족 가능성)\")\n        return None\n    return last_value",
+        "file_location": "/Users/minseop/proj/auto-trading/src/indicator_calculator.py:72-76"
+      },
+      {
+        "step_number": 4,
+        "title": "strategy_manager.py: check_enter_signal vol_ma 타입 변경",
+        "description": "vol_ma 파라미터 타입을 float에서 Optional[float]로 변경한다.",
+        "code_example": "# Before (line 25):\nvol_ma: float,\n\n# After:\nvol_ma: Optional[float],",
+        "file_location": "/Users/minseop/proj/auto-trading/src/strategy_manager.py:25"
+      },
+      {
+        "step_number": 5,
+        "title": "strategy_manager.py: 로그 메시지 업데이트",
+        "description": "거래량 필터 로그에서 기준값 표시 시 '30분봉 SMA'임을 명시한다.",
+        "code_example": "# Before (lines 67-73):\nlogger.info(\n    \"  [%s] 거래량 필터: 최근 %d분 거래량=%.2f, 기준=%.2f\",\n    ...\n)\n\n# After:\nlogger.info(\n    \"  [%s] 거래량 필터: 최근 %d분 거래량=%.2f, 기준(30분봉 SMA)=%.2f\",\n    ...\n)",
+        "file_location": "/Users/minseop/proj/auto-trading/src/strategy_manager.py:67-73"
+      },
+      {
+        "step_number": 6,
+        "title": "strategy_manager.py: is_period_volume_above_minimum vol_ma 타입 및 None 가드",
+        "description": "vol_ma를 Optional[float]로 변경하고, MOVING_AVERAGE 모드에서 None이면 False 반환.",
+        "code_example": "# Before (line 228):\ndef is_period_volume_above_minimum(minute_df: pd.DataFrame, vol_ma: float) -> bool:\n    ...\n    return recent_volume_sum > vol_ma\n\n# After:\ndef is_period_volume_above_minimum(minute_df: pd.DataFrame, vol_ma: Optional[float]) -> bool:\n    ...\n    if vol_ma is None:\n        logger.warning(\"거래량 이동평균값 없음 (30분봉 데이터 부족) - 진입 차단\")\n        return False\n    return recent_volume_sum > vol_ma",
+        "file_location": "/Users/minseop/proj/auto-trading/src/strategy_manager.py:227-256"
+      },
+      {
+        "step_number": 7,
+        "title": "data_manager.py: _max_candles 증가",
+        "description": "30분봉 SMA(100) 안정적 계산을 위해 _max_candles를 100에서 150으로 증가.",
+        "code_example": "# Before (line 42):\nself._max_candles = 100\n\n# After:\nself._max_candles = 150",
+        "file_location": "/Users/minseop/proj/auto-trading/src/data_manager.py:42"
+      },
+      {
+        "step_number": 8,
+        "title": "data_manager.py: vol_ma 계산 데이터 소스 변경",
+        "description": "df_1m → df_nm, VOL_MA_WINDOW_MINUTE → VOL_MA_WINDOW_NM, vol_ma_1m → vol_ma_nm",
+        "code_example": "# Before (lines 129-132):\nvol_ma_1m = IndicatorCalculator.get_latest_volume_ma(\n    df=self.df_1m, length=settings.VOL_MA_WINDOW_MINUTE\n)\n\n# After:\nvol_ma_nm = IndicatorCalculator.get_latest_volume_ma(\n    df=self.df_nm, length=settings.VOL_MA_WINDOW_NM\n)",
+        "file_location": "/Users/minseop/proj/auto-trading/src/data_manager.py:129-132"
+      },
+      {
+        "step_number": 9,
+        "title": "data_manager.py: check_enter_signal 호출부 변수명 변경",
+        "description": "vol_ma=vol_ma_1m → vol_ma=vol_ma_nm",
+        "code_example": "# Before (line 147):\nvol_ma=vol_ma_1m,\n\n# After:\nvol_ma=vol_ma_nm,",
+        "file_location": "/Users/minseop/proj/auto-trading/src/data_manager.py:147"
+      },
+      {
+        "step_number": 10,
+        "title": "trader.py: 30분봉 초기 로딩 limit 증가",
+        "description": "30분봉 과거 데이터 로딩 limit을 100에서 150으로 증가.",
+        "code_example": "# Before (lines 28-31):\nhistorical_30m = self._binance_client.get_historical_klines(\n    interval=CandleType.CANDLE_30MIN.value,\n    limit=100,\n)\n\n# After:\nhistorical_30m = self._binance_client.get_historical_klines(\n    interval=CandleType.CANDLE_30MIN.value,\n    limit=150,\n)",
+        "file_location": "/Users/minseop/proj/auto-trading/src/trader.py:28-31"
+      },
+      {
+        "step_number": 11,
+        "title": "docs/ 문서 업데이트 (3개 파일, 9곳)",
+        "description": "STRATEGY.md(3곳), COMPONENTS.md(3곳), CONFIGURATION.md(3곳) 업데이트",
+        "code_example": "STRATEGY.md: Line 85, 422, 474 - VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM\nCOMPONENTS.md: Line 445-447, 464 - vol_ma_1m -> vol_ma_nm, df_1m -> df_nm\nCONFIGURATION.md: Line 294, 301, 449 - VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM",
+        "file_location": "/Users/minseop/proj/auto-trading/docs/"
+      }
+    ]
+  },
+  "risks_and_considerations": [
+    {
+      "risk": "스케일 불일치: 1분봉 20분 합산 vs 30분봉 SMA(100) → 거래량 비교 기준이 크게 달라져 필터가 약 67% 더 엄격해질 수 있음",
+      "severity": "high",
+      "mitigation": "DRY_RUN=True 상태에서 충분한 기간 모니터링 후 프로덕션 배포. 로그에서 vol_ma 값과 recent_volume_sum 비교값을 확인하여 적절한 진입 빈도인지 검증."
+    },
+    {
+      "risk": "_max_candles가 df_nm과 df_1m 모두에 적용되어 1분봉도 150개로 증가",
+      "severity": "low",
+      "mitigation": "1분봉 50개 추가 저장은 메모리 영향 미미."
+    },
+    {
+      "risk": "서버 시작 시 바이낸스 API에서 150개 미만 반환 시 SMA(100) 계산 불가",
+      "severity": "low",
+      "mitigation": "NaN 가드 + None 가드로 안전하게 진입 차단. 데이터 축적 후 정상 동작."
+    },
+    {
+      "risk": "VOL_MA_WINDOW_NM 값을 _max_candles(150)보다 크게 설정하면 영구적으로 진입 불가",
+      "severity": "medium",
+      "mitigation": "기본값 100은 안전. .env 수정 시 주의 필요."
+    },
+    {
+      "risk": "환경변수명 변경(VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM)으로 인한 배포 호환성",
+      "severity": "medium",
+      "mitigation": "배포 시 .env와 Docker 환경변수를 동시에 업데이트. 이전 키는 pydantic에서 인식 안됨 → 기본값(100) 적용."
+    },
+    {
+      "risk": "테스트 코드 부재로 변경 후 회귀 테스트 불가",
+      "severity": "low",
+      "mitigation": "DRY_RUN 모드로 실환경 검증. 향후 단위 테스트 추가 권장."
+    }
+  ],
+  "test_strategy": {
+    "unit_tests": [
+      "IndicatorCalculator.get_latest_volume_ma(): 100개 미만 데이터 시 None 반환",
+      "IndicatorCalculator.get_latest_volume_ma(): 정확히 100개 데이터 시 유효 float 반환",
+      "IndicatorCalculator.get_latest_volume_ma(): 150개 데이터 시 정상 float 반환",
+      "StrategyManager.is_period_volume_above_minimum(): vol_ma=None 시 False 반환",
+      "StrategyManager.is_period_volume_above_minimum(): vol_ma=유효값 시 정상 비교",
+      "StrategyManager.check_enter_signal(): vol_ma=None 시 거래량 필터 차단"
+    ],
+    "integration_tests": [
+      "DataManager: df_nm 기반 vol_ma_nm 계산 → StrategyManager 전달 전체 흐름",
+      "서버 시작 시 150개 30분봉 로딩 → SMA(100) 정상 계산",
+      "DRY_RUN 모드에서 vol_ma_nm 로그값 확인"
+    ],
+    "edge_cases": [
+      "30분봉 데이터 0개 → None → 진입 차단",
+      "30분봉 데이터 99개 → NaN → None → 진입 차단",
+      "30분봉 데이터 100개 → 유효값 1개 → 정상 동작",
+      "VOLUME_FILTER_TYPE=ABSOLUTE → vol_ma 미사용 → 영향 없음",
+      "ENABLE_PERIOD_VOLUME=False → 거래량 필터 스킵 → 영향 없음",
+      "VOL_MA_WINDOW_NM=151 (>_max_candles) → 영구 진입 차단"
+    ]
+  },
+  "documentation_updates": [
+    {
+      "file": "/Users/minseop/proj/auto-trading/docs/STRATEGY.md",
+      "section": "Line 85, 422, 474",
+      "changes": "VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM, '1-minute' -> '30-minute candles'"
+    },
+    {
+      "file": "/Users/minseop/proj/auto-trading/docs/COMPONENTS.md",
+      "section": "Lines 445-447, 464",
+      "changes": "vol_ma_1m -> vol_ma_nm, df_1m -> df_nm, VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM"
+    },
+    {
+      "file": "/Users/minseop/proj/auto-trading/docs/CONFIGURATION.md",
+      "section": "Lines 294, 297, 301, 449",
+      "changes": "VOL_MA_WINDOW_MINUTE -> VOL_MA_WINDOW_NM, '1-minute based' -> '30-minute based'"
+    }
+  ],
+  "related_references": {
+    "existing_implementations": [
+      "/Users/minseop/proj/auto-trading/src/utils/config.py:43",
+      "/Users/minseop/proj/auto-trading/.env:29",
+      "/Users/minseop/proj/auto-trading/src/indicator_calculator.py:56-83",
+      "/Users/minseop/proj/auto-trading/src/strategy_manager.py:21-28",
+      "/Users/minseop/proj/auto-trading/src/strategy_manager.py:227-256",
+      "/Users/minseop/proj/auto-trading/src/data_manager.py:42",
+      "/Users/minseop/proj/auto-trading/src/data_manager.py:129-132",
+      "/Users/minseop/proj/auto-trading/src/data_manager.py:144-150",
+      "/Users/minseop/proj/auto-trading/src/trader.py:28-31"
+    ],
+    "similar_patterns": [
+      "/Users/minseop/proj/auto-trading/src/indicator_calculator.py:17-54 (get_latest_bollinger_bands - same NaN pattern)",
+      "/Users/minseop/proj/auto-trading/src/data_manager.py:113-127 (bollinger band calculation - same df_nm/df_1m pattern)"
+    ],
+    "dependencies": [
+      "pandas",
+      "pandas_ta (ta.sma)",
+      "pydantic (Field, BaseSettings)",
+      "pydantic_settings"
+    ]
+  }
+}

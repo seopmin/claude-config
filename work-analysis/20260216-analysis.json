@@ -1,0 +1,202 @@
+{
+  "task": {
+    "title": "지정가 손절 실패 시 시장가 손절 전환 기능",
+    "description": "CLOSING_SL 상태에서 지정가 손절 주문이 걸려있을 때, 1분봉 캔들 close 가격이 지정가보다 불리한 방향으로 지나가면(LONG: 현재가 < 손절지정가, SHORT: 현재가 > 손절지정가) 기존 지정가 주문을 취소하고 시장가로 즉시 손절한다.",
+    "priority": "high"
+  },
+  "affected_components": [
+    {
+      "name": "type.py",
+      "file": "/Users/minseop/proj/auto-trading/src/type.py",
+      "reason": "EXIT_SL_MARKET 액션 추가 및 ExitSlMarketRequest 타입 정의"
+    },
+    {
+      "name": "PositionState",
+      "file": "/Users/minseop/proj/auto-trading/src/position_state.py",
+      "reason": "_sl_market_triggered 플래그 및 try_trigger_sl_market() 원자적 전환 메서드 추가"
+    },
+    {
+      "name": "DataManager",
+      "file": "/Users/minseop/proj/auto-trading/src/data_manager.py",
+      "reason": "1분봉 CLOSING_SL 감지 로직 추가 (_check_sl_limit_failure)"
+    },
+    {
+      "name": "ApiManager",
+      "file": "/Users/minseop/proj/auto-trading/src/api_manager.py",
+      "reason": "EXIT_SL_MARKET 핸들러 추가 (_handle_exit_sl_market)"
+    },
+    {
+      "name": "CLAUDE.md",
+      "file": "/Users/minseop/proj/auto-trading/CLAUDE.md",
+      "reason": "시장가 손절 전환 흐름 문서화"
+    }
+  ],
+  "architecture_patterns": {
+    "primary": "Queue-based Action Pattern",
+    "secondary": ["State Machine", "Thread-Safe Singleton", "Fallback Strategy"],
+    "justification": "기존 ApiRequestAction + API Queue 패턴을 확장하여 EXIT_SL_MARKET 액션을 추가. 상태 머신에 _sl_market_triggered 플래그를 추가하여 중복 전환을 원자적으로 방지. 기존 cancel_order + create_market_order API를 조합하여 구현."
+  },
+  "implementation_guide": {
+    "steps": [
+      {
+        "step_number": 1,
+        "title": "type.py - EXIT_SL_MARKET 액션 및 ExitSlMarketRequest 타입 추가",
+        "description": "ApiRequestAction에 EXIT_SL_MARKET 값을 추가하고, 시장가 손절에 필요한 요청 타입을 정의한다. sl_order_id(취소할 지정가 주문), direction, qty, fallback_price(DRY_RUN 시 avgPrice=0 대비)를 포함한다. ApiRequest 유니온 타입에도 ExitSlMarketRequest를 추가한다.",
+        "code_example": "# ApiRequestAction 열거형에 추가\nclass ApiRequestAction(Enum):\n    ENTER_POSITION = \"ENTER_POSITION\"\n    EXIT_TP = \"EXIT_TP\"\n    EXIT_SL = \"EXIT_SL\"\n    EXIT_SL_MARKET = \"EXIT_SL_MARKET\"  # 시장가 손절 (지정가 실패 시 전환)\n    CANCEL_ORDER = \"CANCEL_ORDER\"\n    CHECK_ORDER_STATUS = \"CHECK_ORDER_STATUS\"\n\n# ExitSlRequest 다음에 새 타입 추가\nclass ExitSlMarketRequest(TypedDict):\n    action: ApiRequestAction\n    sl_order_id: str\n    direction: PositionDirectionType\n    qty: float\n    fallback_price: float\n\n# ApiRequest 유니온 업데이트\nApiRequest = (\n    EnterPositionRequest\n    | ExitTpRequest\n    | ExitSlRequest\n    | ExitSlMarketRequest\n    | CancelOrderRequest\n    | CheckOrderStatusRequest\n)",
+        "file_location": "src/type.py:72"
+      },
+      {
+        "step_number": 2,
+        "title": "position_state.py - _sl_market_triggered 플래그 및 try_trigger_sl_market() 추가",
+        "description": "_sl_market_triggered 플래그를 __init__에 추가하고, CLOSING_SL -> ENTERING 원자적 전환 메서드를 구현한다. clear_position()에서 플래그를 리셋한다.",
+        "code_example": "# __init__에 플래그 추가\nself._sl_market_triggered = False\n\n# try_start_closing() 뒤에 새 메서드 추가\ndef try_trigger_sl_market(self) -> bool:\n    with self._state_lock:\n        if self._state == PositionStateType.CLOSING_SL and not self._sl_market_triggered:\n            self._sl_market_triggered = True\n            self._state = PositionStateType.ENTERING\n            return True\n        return False\n\n# clear_position()에 플래그 리셋 추가\nself._sl_market_triggered = False",
+        "file_location": "src/position_state.py:48"
+      },
+      {
+        "step_number": 3,
+        "title": "data_manager.py - 1분봉 CLOSING_SL 감지 로직 추가",
+        "description": "1분봉 처리 분기에서 CLOSING_SL 상태일 때 _check_sl_limit_failure()를 호출. LONG: 현재가 < 손절지정가, SHORT: 현재가 > 손절지정가일 때 실패 판정. try_trigger_sl_market()으로 원자적 전환 후 EXIT_SL_MARKET 요청을 API Queue에 추가.",
+        "code_example": "# import 추가\nfrom type import ExitSlMarketRequest, PositionDirectionType\n\n# 1분봉 분기에 감지 로직 추가\nif candle.type == CandleType.CANDLE_1MIN:\n    self.df_1m = self._update_dataframe(self.df_1m, candle.candle)\n    self._check_sl_limit_failure(candle)\n\n# 새 메서드\ndef _check_sl_limit_failure(self, candle) -> None:\n    if not self.position.is_closing_sl():\n        return\n    pos_info = self.position.get_position_info()\n    sl_order_price = pos_info.get(\"exit_order_price\")\n    direction = pos_info.get(\"direction\")\n    current_price = candle.candle[\"close\"]\n    \n    sl_failed = False\n    if direction == PositionDirectionType.LONG:\n        sl_failed = current_price < sl_order_price\n    elif direction == PositionDirectionType.SHORT:\n        sl_failed = current_price > sl_order_price\n    \n    if not sl_failed:\n        return\n    if not self.position.try_trigger_sl_market():\n        return\n    \n    api_request = {\n        \"action\": ApiRequestAction.EXIT_SL_MARKET,\n        \"sl_order_id\": pos_info.get(\"order_id\"),\n        \"direction\": direction,\n        \"qty\": pos_info.get(\"quantity\"),\n        \"fallback_price\": current_price,\n    }\n    try:\n        self.api_queue.put_nowait(api_request)\n    except queue.Full:\n        self.position.clear_position()",
+        "file_location": "src/data_manager.py:100"
+      },
+      {
+        "step_number": 4,
+        "title": "api_manager.py - EXIT_SL_MARKET 핸들러 추가",
+        "description": "match문에 EXIT_SL_MARKET 케이스 추가. 핸들러는 (1) ENTERING 상태 확인, (2) 기존 지정가 취소, (3) 시장가 주문, (4) 거래 기록 저장, (5) 포지션 초기화, (6) Discord 알림.",
+        "code_example": "# import 추가\nfrom type import ExitSlMarketRequest\n\n# match문에 케이스 추가\ncase ApiRequestAction.EXIT_SL_MARKET:\n    self._handle_exit_sl_market(api_request)\n\n# 핸들러 구현\ndef _handle_exit_sl_market(self, request: ExitSlMarketRequest):\n    direction = None\n    try:\n        if self.position.get_state() != PositionStateType.ENTERING:\n            return\n        direction = request[\"direction\"]\n        sl_order_id = request[\"sl_order_id\"]\n        quantity = request[\"qty\"]\n        fallback_price = request[\"fallback_price\"]\n        \n        try:\n            self.binance_client.cancel_order(order_id=sl_order_id)\n        except Exception as cancel_err:\n            logger.warning(\"손절 지정가 취소 실패: %s\", cancel_err)\n        \n        side = \"SELL\" if direction == PositionDirectionType.LONG else \"BUY\"\n        order_response = self.binance_client.create_market_order(side=side, quantity=quantity)\n        \n        market_order_id = str(order_response[\"orderId\"])\n        avg_price = float(order_response.get(\"avgPrice\", 0))\n        if avg_price == 0:\n            avg_price = fallback_price\n        executed_qty = float(order_response.get(\"executedQty\", quantity))\n        \n        entry_price = self.position.get_position_info().get(\"entry_price\")\n        trade_record = self.trade_history.add_trade(\n            trade_id=market_order_id, direction=direction.value,\n            entry_price=entry_price, exit_price=avg_price,\n            quantity=executed_qty, exit_type=\"SL\",\n        )\n        \n        self.position.clear_position()\n        \n        stats_summary = self.trade_history.get_stats_summary()\n        self.notifier.send(\n            title=\"시장가 손절 체결 (지정가 실패 전환)\",\n            description=f\"방향: {direction.value}\\n체결가: {avg_price}\\n손익률: {trade_record.pnl_percent}%\\n{stats_summary}\",\n        )\n    except Exception as e:\n        logger.error(\"시장가 손절 실패: %s\", e, exc_info=True)\n        self.notifier.send_error(\"시장가 손절 실패\", e)\n        self.position.clear_position()",
+        "file_location": "src/api_manager.py:69"
+      },
+      {
+        "step_number": 5,
+        "title": "OrderMonitorManager - 변경 불필요",
+        "description": "try_trigger_sl_market()이 CLOSING_SL -> ENTERING 전환하면 OrderMonitor는 ENTERING 상태를 감지하여 아무 동작도 하지 않는다. 이미 큐에 들어간 CHECK_ORDER_STATUS도 _handle_check_order_status에서 is_closing_sl()=False이므로 무시된다.",
+        "code_example": "# 변경 없음",
+        "file_location": "src/order_monitor_manager.py:89"
+      },
+      {
+        "step_number": 6,
+        "title": "CLAUDE.md 문서 업데이트",
+        "description": "포지션 상태 머신의 손절 흐름에 시장가 전환 분기를 추가하고, ApiRequestAction과 PositionState 설명을 업데이트한다.",
+        "code_example": "손절 흐름 (시장가 폴백 포함):\nCLOSING_SL -> 1분봉 감지(현재가 > 지정가 초과) -> try_trigger_sl_market() -> ENTERING -> cancel + market order -> clear_position() -> IDLE",
+        "file_location": "CLAUDE.md"
+      }
+    ]
+  },
+  "risks_and_considerations": [
+    {
+      "risk": "OrderMonitor CHECK_ORDER_STATUS와 DataManager EXIT_SL_MARKET 레이스 컨디션",
+      "severity": "high",
+      "mitigation": "try_trigger_sl_market()의 원자적 CLOSING_SL -> ENTERING 전환으로 보호. CHECK_ORDER_STATUS가 ENTERING 상태에서 처리되면 is_closing_sl()=False이므로 무시됨."
+    },
+    {
+      "risk": "지정가 취소와 체결 동시 발생으로 이중 포지션 위험",
+      "severity": "high",
+      "mitigation": "cancel_order 실패 시 경고 로그. 시장가 주문은 계속 진행하되, 운영 중 모니터링 필요. 향후 cancel 실패 시 get_order_status FILLED 확인 로직 추가 권장."
+    },
+    {
+      "risk": "시장가 주문 실패 시 ENTERING 상태 영구 정체",
+      "severity": "high",
+      "mitigation": "except에서 clear_position()으로 IDLE 강제 복구 + Discord 알림."
+    },
+    {
+      "risk": "부분 체결 수량 불일치",
+      "severity": "medium",
+      "mitigation": "초기 구현은 전량 시장가 주문. 향후 cancel 응답의 executedQty 확인하여 잔여 수량만 주문하는 개선 가능."
+    },
+    {
+      "risk": "API Queue Full로 시장가 손절 요청 실패",
+      "severity": "medium",
+      "mitigation": "Queue Full 시 clear_position()으로 IDLE 복구. _sl_market_triggered도 리셋됨."
+    },
+    {
+      "risk": "DRY_RUN 시 avgPrice=0 반환",
+      "severity": "low",
+      "mitigation": "ExitSlMarketRequest의 fallback_price(1분봉 close)를 대체값으로 사용."
+    },
+    {
+      "risk": "WebSocket 끊김 시 1분봉 수신 중단으로 감지 불가",
+      "severity": "low",
+      "mitigation": "기존 WebSocket 재연결 메커니즘(최대 5회)에 의존. 본 변경 범위 밖."
+    }
+  ],
+  "test_strategy": {
+    "unit_tests": [
+      "try_trigger_sl_market(): CLOSING_SL 상태에서 True 반환 및 ENTERING 전환",
+      "try_trigger_sl_market(): CLOSING_SL 외 상태에서 False 반환",
+      "try_trigger_sl_market(): 중복 호출 시 두 번째 False",
+      "clear_position(): _sl_market_triggered 리셋 확인",
+      "_check_sl_limit_failure(): LONG - 현재가 < 지정가 트리거",
+      "_check_sl_limit_failure(): SHORT - 현재가 > 지정가 트리거",
+      "_check_sl_limit_failure(): 현재가 == 지정가 미트리거",
+      "_check_sl_limit_failure(): CLOSING_SL 아닌 상태 즉시 리턴",
+      "_handle_exit_sl_market(): 정상 흐름 (cancel + market)",
+      "_handle_exit_sl_market(): DRY_RUN fallback_price 사용",
+      "_handle_exit_sl_market(): 실패 시 clear_position()"
+    ],
+    "integration_tests": [
+      "전체 흐름: CLOSING_SL -> 1분봉 감지 -> EXIT_SL_MARKET -> IDLE",
+      "정상 지정가 손절 미간섭 확인",
+      "CHECK_ORDER_STATUS + EXIT_SL_MARKET 동시 큐 처리"
+    ],
+    "edge_cases": [
+      "현재가 == 손절 지정가 (미트리거)",
+      "Queue Full 시 clear_position() 복구",
+      "cancel 실패 후 시장가 진행",
+      "연속 1분봉 중복 트리거 방지",
+      "포지션 정보 누락 시 안전 리턴"
+    ]
+  },
+  "documentation_updates": [
+    {
+      "file": "CLAUDE.md",
+      "section": "포지션 상태 머신 - 손절 흐름",
+      "changes": "시장가 전환 흐름 추가: CLOSING_SL -> 1분봉 감지 -> ENTERING -> cancel + market -> IDLE"
+    },
+    {
+      "file": "CLAUDE.md",
+      "section": "주요 컴포넌트 - ApiManager",
+      "changes": "EXIT_SL_MARKET 액션 설명 추가"
+    },
+    {
+      "file": "CLAUDE.md",
+      "section": "주요 컴포넌트 - PositionState",
+      "changes": "_sl_market_triggered 및 try_trigger_sl_market() 설명 추가"
+    },
+    {
+      "file": "CLAUDE.md",
+      "section": "데이터 흐름 - 손절 시나리오",
+      "changes": "시장가 전환 시나리오 추가"
+    }
+  ],
+  "related_references": {
+    "existing_implementations": [
+      "src/type.py:72-79 (ApiRequestAction enum)",
+      "src/type.py:100-107 (ExitSlRequest 참고 패턴)",
+      "src/type.py:123-129 (ApiRequest union)",
+      "src/position_state.py:36-48 (__init__ 플래그 위치)",
+      "src/position_state.py:162-172 (clear_position 리셋 위치)",
+      "src/position_state.py:222-233 (try_start_closing 참고 패턴)",
+      "src/data_manager.py:100-101 (1분봉 분기 진입점)",
+      "src/data_manager.py:222-224 (CLOSING_SL stub - 건드리지 않음)",
+      "src/api_manager.py:69-81 (match문 케이스 추가 위치)",
+      "src/api_manager.py:171-215 (_handle_exit_sl 참고 패턴)",
+      "src/api_manager.py:92-123 (_handle_cancel_order - PENDING 전용)",
+      "src/binance_client.py:280-328 (create_market_order)",
+      "src/binance_client.py:360-393 (cancel_order)",
+      "src/order_monitor_manager.py:89-98 (변경 불필요)"
+    ],
+    "similar_patterns": [
+      "src/position_state.py:209-220 (try_start_entering 원자적 전환)",
+      "src/position_state.py:222-233 (try_start_closing 원자적 전환)",
+      "src/api_manager.py:171-215 (_handle_exit_sl 손절 핸들러)",
+      "src/api_manager.py:260-264 (실패 시 IDLE 복구 패턴)"
+    ],
+    "dependencies": [
+      "binance_client.cancel_order()",
+      "binance_client.create_market_order()",
+      "trade_history.add_trade()",
+      "position_state.clear_position()",
+      "notifier.send() / notifier.send_error()"
+    ]
+  }
+}
